@@ -1,0 +1,18 @@
+[package]
+name = "loader"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dlopen = "*"
+dlopen_derive = "*"
+libloading = "*"
+crossbeam = "*"
+lazy_static = "*"
+va_list = "*"
+paste="*"
+libc = "*"
+parking_lot = "*"
+lock_api = "*"

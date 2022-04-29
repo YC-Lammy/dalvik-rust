@@ -1,0 +1,41 @@
+[package]
+name = "dalvik-rust"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+#cranelift = "0.81"
+#cranelift-jit="*"
+#cranelift-module="*"
+
+bitflags = "*"
+
+leb128 = "0.2.4"
+byteorder = "1.3.2"
+mutf8 = "0.2.0"
+failure = "0.1.6"
+
+rustc-hash = "*"
+parking_lot = "*"
+lock_api = "*"
+paste = "*"
+
+lazy_static = "*"
+chrono = "*"
+arboard = "*"
+atomic = "*"
+crossbeam = "*"
+rusqlite = {version = "0.27", features = ["modern-full"]}
+libsqlite3-sys = {version="0.24", features = []}
+jni = { version = "0.19.0", features = ["invocation"] }
+
+libc = "*"
+
+[dependencies.nom]
+version = "4.2.3"
+features = ["verbose-errors"]
+
+[build]
+target = "x86_64-unknown-linux-gnu"
