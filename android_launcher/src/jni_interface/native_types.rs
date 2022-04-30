@@ -10,6 +10,7 @@ pub fn register(env:JNIEnv) -> Result<(), Error>{
     Trace::register(env)?;
     Clipboard::register(env)?;
     RestrictionManager::register(env)?;
+    CursorWindow::register(env)?;
     SQLiteConnection::register(env)?;
     return Ok(())
 }
@@ -411,7 +412,10 @@ mod RestrictionManager{
     }
 }
 
+
+#[allow(unused_must_use, non_snake_case)]
 pub mod CursorWindow{
+    use std::borrow::Cow;
     use std::mem::size_of;
     use std::sync::Arc;
 
@@ -424,192 +428,346 @@ pub mod CursorWindow{
 
     use crate::jni_interface::parcel::Parcel;
 
+    pub const kInlineSize:usize = 16384;
+    pub const kSlotShift:usize = 4;
+    pub const kSlotSizeBytes:usize = 1 << kSlotShift;
+
+
+    /**
+     * This class stores a set of rows from a database in a buffer. Internally
+     * data is structured as a "heap" of string/blob allocations at the bottom
+     * of the memory region, and a "stack" of FieldSlot allocations at the top
+     * of the memory region. Here's an example visual representation:
+     *
+     *   +----------------------------------------------------------------+
+     *   |heap\0of\0strings\0                                 222211110000| ...
+     *   +-------------------+--------------------------------+-------+---+
+     *    ^                  ^                                ^       ^   ^     ^
+     *    |                  |                                |       |   |     |
+     *    |                  +- mAllocOffset    mSlotsOffset -+       |   |     |
+     *    +- mData                                       mSlotsStart -+   |     |
+     *                                                             mSize -+     |
+     *                                                           mInflatedSize -+
+     *
+     * Strings are stored in UTF-8.
+     */
     pub struct CursorWindow{
         pub name:String,
-        pub bytes:Vec<u8>,
+
+        pub data:Vec<u8>,
+        pub inflatedSize:usize,
+
+        pub SlotStart:usize,
+        pub SlotEnd:usize,
+
+        /// Offset to the top of the "heap" of string/blob allocations. By
+        /// storing these allocations at the bottom of our memory region we
+        /// avoid having to rewrite offsets when inflating.
+        pub allocOffset:usize,
+
+        ///Offset to the bottom of the "stack" of FieldSlot allocations.
+        pub slotsOffset:usize,
+
         pub columns:usize,
         pub rows:usize,
+
+        pub readOnly:bool,
+
         /// in bytes
         pub row_length:usize,
         pub types:Vec<Types>
     }
-
-    type Types = rusqlite::types::Type;
-
-    pub enum Value{
-        Blob(Vec<u8>),
-        String(String),
+    
+    
+    #[repr(u8)]
+    pub enum FieldSlot{
         Int(i64),
-        Double(f64),
+        Float(f64),
+        String{
+            offset:u32,
+            size:u32,
+        },
+        Blob{
+            offset:u32,
+            size:u32
+        },
         Null
     }
 
+    type Types = rusqlite::types::Type;
+
     impl CursorWindow {
-        pub fn getOffset(&self, column:usize, row:usize) -> Result<usize, String>{
-            let mut column_off = 0;
-            for t in &self.types{
-                match *t{
-                    Types::Blob => column_off += size_of::<Vec<u8>>(),
-                    Types::Text => column_off += size_of::<String>(),
-                    Types::Integer => column_off += size_of::<i64>(),
-                    Types::Real => column_off += size_of::<f64>(),
-                    Types::Null => unreachable!()
-                }
-            };
-            let mut offx = 0;
-            let mut i=0;
-            while i<column{
-                match self.types[i]{
-                    Types::Blob => offx += size_of::<Option<Vec<u8>>>(),
-                    Types::Text => offx += size_of::<Option<String>>(),
-                    Types::Integer => offx += size_of::<Option<i64>>(),
-                    Types::Real => offx += size_of::<Option<f64>>(),
-                    Types::Null => unreachable!()
-                }
-                i+=1;
-            };
-            let re = column_off*row + offx;
-            if re > self.bytes.len(){
-                return Err(format!("data exceding allocated bytes: {}, got {}.", self.bytes.len(), re))
-            }
-            return Ok(re);
+        pub fn updateSlotsData(&mut self){
+            self.SlotStart = self.data.len() - kSlotSizeBytes;
+            self.SlotEnd = self.slotsOffset;
         }
 
-        pub unsafe fn write(&self, column:usize, row:usize, value:Value) -> Result<(), String>{
-            if self.columns < column{
-                return Err(format!("column {} was not allocated.", column));
+        pub fn maybeInflated(&mut self){
+            if self.data.len() < self.inflatedSize{
+                let slotsSize = self.data.len() - self.slotsOffset;
+                let newSlotsOffset = self.inflatedSize - slotsSize;
+                let mut newData = Vec::with_capacity(self.inflatedSize);
+                newData.resize(self.inflatedSize, 0u8);
+                newData[0..self.allocOffset].copy_from_slice(&self.data[0..self.allocOffset]);
+                newData[newSlotsOffset..].copy_from_slice(&self.data[self.slotsOffset..]);
+
+                self.data = newData;
+                self.slotsOffset = newSlotsOffset;
+
+                self.updateSlotsData();
             }
-            match value{
-                Value::Blob(b) => {
-                    if !(self.types[column-1] == Types::Blob){
-                        return Err(format!("column {} is type {}, found Blob.", column, self.types[column-1]))
-                    }
-                    let ptr = (self.bytes.as_ptr()).add(self.getOffset(column, row)?) as *mut Option<Vec<u8>>;
-                    let b = Some(b);
-                    ptr.swap(&b as *const Option<Vec<u8>> as *mut _); // swap out the old value to be dropped
-                    drop(b);
-                },
-                Value::String(s) => {
-                    if !(self.types[column-1] == Types::Text){
-                        return Err(format!("column {} is type {}, found String.", column, self.types[column-1]))
-                    }
-                    let ptr = (self.bytes.as_ptr()).add(self.getOffset(column, row)?) as *mut Option<String>;
-                    let s = Some(s);
-                    ptr.swap(&s as *const Option<String> as *mut _); // swap out the old value to be dropped
-                    drop(s);
-                },
-                Value::Int(i) => {
-                    if !(self.types[column-1] == Types::Integer){
-                        return Err(format!("column {} is type {}, found Int.", column, self.types[column-1]))
-                    }
-                    let ptr = (self.bytes.as_ptr()).add(self.getOffset(column, row)?) as *mut Option<i64>;
-                    *ptr = Some(i);
-                },
-                Value::Double(d) => {
-                    if !(self.types[column-1] == Types::Real){
-                        return Err(format!("column {} is type {}, found Double.", column, self.types[column-1]))
-                    }
-                    let ptr = (self.bytes.as_ptr()).add(self.getOffset(column, row)?) as *mut Option<f64>;
-                    *ptr = Some(d);
-                },
-                Value::Null => {
-                    match self.types[column-1]{
-                        Types::Text => {
-                            let ptr = (self.bytes.as_ptr()).add(self.getOffset(column, row)?) as *mut Option<String>;
-                            *ptr = None;
-                        },
-                        Types::Blob => {
-                            let ptr = (self.bytes.as_ptr()).add(self.getOffset(column, row)?) as *mut Option<Vec<u8>>;
-                            *ptr = None;
-                        },
-                        Types::Integer => {
-                            let ptr = (self.bytes.as_ptr()).add(self.getOffset(column, row)?) as *mut Option<f64>;
-                            *ptr = None;
-                        },
-                        Types::Real => {
-                            let ptr = (self.bytes.as_ptr()).add(self.getOffset(column, row)?) as *mut Option<f64>;
-                            *ptr = None;
-                        },
-                        Types::Null => unreachable!()
-                    }
-                }
-            }
-            return Ok(());
         }
 
-        pub unsafe fn read(&self, column:usize, row:usize, ty:Types) -> Result<Value, String>{
-            if self.columns < column{
-                return Err(format!("column {} was not allocated.", column));
+        pub fn offsetToPtr<'a>(&'a self, offset:usize) -> &'a mut [u8]{
+            return unsafe{(&self.data[offset..] as *const [u8] as *mut [u8]).as_mut().unwrap()}
+        }
+
+        pub fn alloc(&mut self, size:usize) -> Option<usize>{
+            if self.readOnly{
+                return None;
             }
-            match ty{
-                Types::Blob => {
-                    if !(self.types[column-1] == ty){
-                        return Err(format!("column {} is type {}, found Blob.", column, self.types[column-1]))
-                    }
-                    let ptr = (self.bytes.as_ptr()).add(self.getOffset(column, row)?) as *mut Option<Vec<u8>>;
-                    let ptr = ptr.as_ref().unwrap();
-                    if let Some(v) = ptr{
-                        return Ok(Value::Blob(v.clone()))
-                    } else{
-                        return  Ok(Value::Null);
-                    }
-                },
-                Types::Text => {
-                    if !(self.types[column-1] == Types::Text){
-                        return Err(format!("column {} is type {}, found String.", column, self.types[column-1]))
-                    }
-                    let ptr = (self.bytes.as_ptr()).add(self.getOffset(column, row)?) as *mut Option<String>;
-                    let ptr = ptr.as_ref().unwrap();
-                    if let Some(v) = ptr{
-                        return Ok(Value::String(v.clone()))
-                    } else{
-                        return  Ok(Value::Null);
-                    }
-                },
-                Types::Integer => {
-                    if !(self.types[column-1] == Types::Integer){
-                        return Err(format!("column {} is type {}, found Int.", column, self.types[column-1]))
-                    }
-                    let ptr = (self.bytes.as_ptr()).add(self.getOffset(column, row)?) as *mut Option<i64>;
-                    if let Some(v) = *ptr{
-                        return Ok(Value::Int(v))
-                    } else{
-                        return  Ok(Value::Null);
-                    }
-                },
-                Types::Real => {
-                    if !(self.types[column-1] == Types::Real){
-                        return Err(format!("column {} is type {}, found Double.", column, self.types[column-1]))
-                    }
-                    let ptr = (self.bytes.as_ptr()).add(self.getOffset(column, row)?) as *mut Option<f64>;
-                    if let Some(v) = *ptr{
-                        return Ok(Value::Double(v))
-                    } else{
-                        return  Ok(Value::Null);
-                    }
-                },
-                Types::Null => {
-                    return Ok(Value::Null);
+
+            let aligned = (size+3) &!3;
+            let mut newOffset = self.allocOffset + aligned;
+
+            if newOffset > self.slotsOffset{
+                self.maybeInflated();
+                newOffset = self.allocOffset + aligned;
+                if newOffset > self.slotsOffset{
+                    return None;
                 }
             }
-            return Ok(Value::Null);
+
+            let offset = self.allocOffset;
+            self.allocOffset = newOffset;
+            return Some(offset);
+        }
+
+        pub fn getSlot<'a>(&'a self, row:usize, column:usize) -> Option<&'a mut FieldSlot>{
+
+            let offset = self.SlotStart - (((row * self.columns) + column) << kSlotShift);
+
+            if offset > self.SlotStart || offset < self.SlotEnd || column >= self.columns{
+                return None;
+            }
+            let result = self.data[offset..].as_ptr();
+            return unsafe{Some((result as *mut FieldSlot).as_mut().unwrap())};
+        }
+
+        pub fn clear(&mut self){
+            self.columns = 0;
+            self.rows = 0;
+            self.allocOffset = 0;
+            self.slotsOffset = self.data.len();
+        }
+
+        pub fn setNumColumns(&mut self, num:usize) -> bool{
+            if (self.columns > 0 || self.rows > 0) && self.columns != num as usize{
+                return false;
+            }
+            self.columns = num;
+            return true;
+        }
+
+        pub fn allocRow(&mut self) -> bool{
+            if self.readOnly{
+                return false;
+            }
+
+            let size = self.columns * kSlotSizeBytes;
+            let mut newOffset = self.slotsOffset - size;
+
+            if newOffset < self.allocOffset{
+                self.maybeInflated();
+                newOffset = self.slotsOffset - size;
+                if newOffset < self.allocOffset{
+                    return false;
+                }
+            }
+
+            self.offsetToPtr(newOffset)[..size].fill(0u8);
+            self.slotsOffset = newOffset;
+            self.updateSlotsData();
+            self.rows += 1;
+            
+            return true;
+        }
+
+        pub fn freeLastRow(&mut self){
+            if self.readOnly{
+                return;
+            }
+
+            let size = self.columns *kSlotSizeBytes;
+            let newOffset = self.slotsOffset + size;
+
+            if newOffset > self.data.len(){
+                return;
+            }
+
+            self.slotsOffset = newOffset;
+            self.updateSlotsData();
+            self.rows -=1;
+        }
+
+        pub fn getBlob<'a>(&'a self, row:usize, column:usize) -> Option<&'a [u8]>{
+            if let Some(slot) = self.getSlot(row, column){
+                match slot{
+                    FieldSlot::Blob { offset, size } => {
+                        return Some(&self.offsetToPtr(*offset as usize)[..*size as usize]);
+                    },
+                    FieldSlot::String { offset, size } => {
+                        return Some(&self.offsetToPtr(*offset as usize)[..*size as usize]);
+                    },
+                    _ => return None
+                }
+            }
+            return None;
+        }
+
+        pub fn getString<'a>(&'a self, row:usize, column:usize) -> Option<Cow<str>>{
+            if let Some(slot) = self.getSlot(row, column){
+                match slot{
+                    FieldSlot::Blob { offset, size } => return None,
+                    FieldSlot::String { offset, size } => {
+                        return Some(
+                            Cow::Borrowed(
+                                std::str::from_utf8(&self.offsetToPtr(*offset as usize)[..*size as usize]).unwrap()
+                            ));
+                    },
+                    FieldSlot::Int(i) => return Some(Cow::Owned(i.to_string())),
+                    FieldSlot::Float(i) => return Some(Cow::Owned(i.to_string())),
+                    FieldSlot::Null => return None,
+                }
+            }
+            return None;
+        }
+
+        pub fn getLong(&self, row:usize, column:usize) -> Option<i64>{
+            if let Some(slot) = self.getSlot(row, column){
+                match slot{
+                    FieldSlot::Int(i) => return Some(*i),
+                    _ => {}
+                }
+            }
+            return None
+        }
+
+        pub fn getDouble(&self, row:usize, column:usize) -> Option<f64>{
+            if let Some(slot) = self.getSlot(row, column){
+                match slot{
+                    FieldSlot::Float(i) => return Some(*i),
+                    _ => {}
+                }
+            }
+            return None
+        }
+
+        pub fn putString(&mut self, row:usize, column:usize, value:&str) -> bool{
+            if self.readOnly{
+                return false;
+            }
+
+            if self.getSlot(row, column).is_none(){
+                
+                return false;
+            }
+
+            let offset = self.alloc(value.len());
+            if offset.is_none(){
+                return false;
+            }
+            let offset = offset.unwrap();
+            self.offsetToPtr(offset)[..value.len()].copy_from_slice(value.as_bytes());
+            
+            let slot = self.getSlot(row, column).unwrap();
+            *slot = FieldSlot::String { offset: offset as u32, size: value.len() as u32 };
+            return true;
+        }
+
+        pub fn putBlob(&mut self, row:usize, column:usize, value:&[u8]) -> bool{
+            if self.readOnly{
+                return false;
+            }
+
+            if self.getSlot(row, column).is_none(){
+                
+                return false;
+            }
+
+            let offset = self.alloc(value.len());
+            if offset.is_none(){
+                return false;
+            }
+            let offset = offset.unwrap();
+            self.offsetToPtr(offset)[..value.len()].copy_from_slice(value);
+            
+            let slot = self.getSlot(row, column).unwrap();
+            *slot = FieldSlot::Blob{ offset: offset as u32, size: value.len() as u32 };
+            return true;
+        }
+
+        pub fn putLong(&mut self, row:usize, column:usize, value:i64) -> bool{
+            if self.readOnly{
+                return false;
+            }
+
+            let slot = self.getSlot(row, column).unwrap();
+            *slot = FieldSlot::Int(value);
+            return true;
+        }
+
+        pub fn putDouble(&mut self, row:usize, column:usize, value:f64) -> bool{
+            if self.readOnly{
+                return false;
+            }
+
+            let slot = self.getSlot(row, column).unwrap();
+            *slot = FieldSlot::Float(value);
+            return true;
+        }
+
+        pub fn putNull(&mut self, row:usize, column:usize) -> bool{
+            if self.readOnly{
+                return false;
+            }
+
+            let slot = self.getSlot(row, column).unwrap();
+            *slot = FieldSlot::Null;
+            return true;
         }
     }
 
     
 
     #[no_mangle]
-    fn Create(env:JNIEnv, obj:JObject, name:JString, size:jint){
+    fn Create(env:JNIEnv, obj:JObject, name:JString, inflatedSize:jint){
         if let Ok(name) = env.get_string(name){
+
+            let size = (inflatedSize as usize).min(kInlineSize);
+
             let mut window = CursorWindow{
                 name:name.to_str().unwrap().to_string(),
-                bytes:Vec::with_capacity(size as usize),
+
+                data:Vec::with_capacity(size),
+                inflatedSize:inflatedSize as usize,
+
+                readOnly:false,
+
+                SlotStart:size - kSlotSizeBytes,
+                SlotEnd:size,
+
+                allocOffset:0,
+                slotsOffset:size,
+
                 columns:0,
                 row_length:0,
                 rows:0,
                 types:Vec::new()
             };
-            window.bytes.resize(size as usize, 0u8);
+
+            window.data.resize(size, 0u8);
+
             let window = Arc::new(RwLock::new(window));
             env.set_rust_field(obj, "mNativePtr", window);
         }
@@ -619,6 +777,35 @@ pub mod CursorWindow{
     fn Dispose(env:JNIEnv, obj:JObject){
         if let Ok(v) = env.take_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
             drop(v);
+        }
+    }
+    
+    #[no_mangle]
+    unsafe fn Clear(env:JNIEnv, obj:JObject){
+        if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+            v.write().clear();
+        }
+    }
+
+    unsafe fn SetNumColumns(env:JNIEnv, obj:JObject, num:jint) -> jboolean{
+        if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+            return v.write().setNumColumns(num as usize) as jboolean
+        }
+        return 0;
+    }
+
+    #[no_mangle]
+    unsafe fn AllowRow(env:JNIEnv, obj:JObject) -> jboolean{
+        if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+            return v.write().allocRow() as jboolean
+        }
+        return 0;
+    }
+
+    #[no_mangle]
+    fn FreeLastRow(env:JNIEnv, obj:JObject){
+        if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+            v.write().freeLastRow()
         }
     }
 
@@ -651,26 +838,44 @@ pub mod CursorWindow{
     }
 
     #[no_mangle]
+    unsafe fn GetNumRows(env:JNIEnv, obj:JObject) -> jint{
+        if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+            return v.read().rows as jint;
+        } else{
+            return 0;
+        }
+    }
+
+    unsafe fn GetType(env:JNIEnv, obj:JObject, row:jint, column:jint) -> jint{
+        if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+            let guard = v.read();
+            let row = row as usize;
+            let column = column as usize;
+
+            if let Some(slot) = guard.getSlot(row, column){
+                match slot{
+                    FieldSlot::Blob { offset, size } => return 4,
+                    FieldSlot::String { offset, size } => return 3,
+                    FieldSlot::Int(i) => return 1,
+                    FieldSlot::Float(i) => return 2,
+                    FieldSlot::Null => return 0,
+                }
+            }
+            
+        }
+        return 0;
+    }
+
+    #[no_mangle]
     unsafe fn GetBlob(env:JNIEnv, obj:JObject, row:jint, column:jint) -> jbyteArray{
         if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+            let guard = v.read();
 
-            let re = v.read().read(column as usize, row as usize, Types::Blob);
+            if let Some(b) = guard.getBlob(row as usize, column as usize){
 
-            if let Ok(v) = re{
-                
-                match v{
-                    Value::Blob(v) => {
-                        return env.byte_array_from_slice(v.as_slice()).unwrap();
-                    },
-                    Value::String(s) => {
-                        return env.byte_array_from_slice(s.as_bytes()).unwrap();
-                    },
-                    Value::Null => return 0 as jbyteArray,
-                    Value::Int(i) => {env.throw(("android/database/sqlite/SQLiteException", "expected type Blob but field is of type Int."));},
-                    Value::Double(i) => {env.throw(("android/database/sqlite/SQLiteException", "expected type Blob but field is of type Double."));},
-                }
-            } else{
-                env.throw(("android/database/sqlite/SQLiteException", re.err().unwrap()));
+                let buffer = env.new_byte_array(b.len() as i32).unwrap();
+                let _ = env.set_byte_array_region(buffer, 0, std::mem::transmute(b));
+                return buffer;
             }
         }
         return 0 as jbyteArray;
@@ -680,72 +885,157 @@ pub mod CursorWindow{
     unsafe fn GetString(env:JNIEnv, obj:JObject, row:jint, column:jint) -> jstring{
         if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
 
-            let re = v.read().read(column as usize, row as usize, Types::Blob);
+            let guard = v.read();
 
-            if let Ok(v) = re{
-                
-                match v{
-                    Value::Blob(v) => {env.throw(("android/database/sqlite/SQLiteException", "expected type String but field is of type Blob."));},
-                    Value::String(s) => {
-                        return env.new_string(s).unwrap().into_inner();
-                    },
-                    Value::Null => return 0 as jbyteArray,
-                    Value::Int(i) => return env.new_string(i.to_string()).unwrap().into_inner(),
-                    Value::Double(i) => return env.new_string(i.to_string()).unwrap().into_inner(),
-                }
-            } else{
-                env.throw(("android/database/sqlite/SQLiteException", re.err().unwrap()));
+            if let Some(s) = guard.getString(row as usize, column as usize){
+                return env.new_string(s).unwrap().into_inner();
             }
+            
         }
         return 0 as jstring;
     }
 
     #[no_mangle]
-    unsafe fn CopyStringToBuffer(env:JNIEnv, obj:JObject, row:jint, column:jint, buffer:jcharArray) -> jint{
+    unsafe fn GetLong(env:JNIEnv, obj:JObject, row:jint, column:jint) -> jlong{
         if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
 
-            let re = v.read().read(column as usize, row as usize, Types::Blob);
+            let guard = v.read();
+            if let Some(v) = guard.getLong(row as usize, column as usize){
+                return v;
+            }
+            
+        }
+        return 0;
+    }
 
-            if let Ok(v) = re{
-                
-                match v{
-                    Value::Blob(v) => {env.throw(("android/database/sqlite/SQLiteException", "expected type String but field is of type Blob."));},
-                    Value::String(s) => {
-                        let mut chars = Vec::new();
-                        for i in s.chars(){
-                            chars.push(i as jchar);
-                        }
-                        env.set_char_array_region(buffer, 0, chars.as_slice());
-                        return chars.len() as jint;
-                    },
-                    Value::Null => return 0,
-                    Value::Int(i) => {
-                        let s = i.to_string();
-                        let mut chars = Vec::new();
-                        for i in s.chars(){
-                            chars.push(i as jchar);
-                        }
-                        env.set_char_array_region(buffer, 0, chars.as_slice());
-                        return chars.len() as jint;
-                    },
-                    Value::Double(i) => {
-                        let s = i.to_string();
-                        let mut chars = Vec::new();
-                        for i in s.chars(){
-                            chars.push(i as jchar);
-                        }
-                        env.set_char_array_region(buffer, 0, chars.as_slice());
-                        return chars.len() as jint;
-                    },
+    #[no_mangle]
+    unsafe fn GetDouble(env:JNIEnv, obj:JObject, row:jint, column:jint) -> jdouble{
+        if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+            let guard = v.read();
+            
+            if let Some(v) = guard.getDouble(row as usize, column as usize){
+                return v;
+            }
+            
+        }
+        return 0.0;
+    }
+
+    #[no_mangle]
+    unsafe fn CopyStringToBuffer(env:JNIEnv, obj:JObject, row:jint, column:jint, buffer:jcharArray) -> jint{
+        
+        if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+            let guard = v.read();
+            let row = row as usize;
+            let column = column as usize;
+
+            if let Some(s) = guard.getString(row as usize, column as usize){
+                let mut cs = Vec::new();
+                for c in s.chars(){
+                    cs.push(c as jchar);
                 }
-            } else{
-                env.throw(("android/database/sqlite/SQLiteException", re.err().unwrap()));
+                env.set_char_array_region(buffer, 0, cs.as_slice());
+                return cs.len() as jint;
+            }
+            
+        }
+        return 0;
+    }
+
+    unsafe fn PutBlob(env:JNIEnv, obj:JObject, value:jbyteArray, row:jint, column:jint) -> jboolean{
+        if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+            if let Ok(len) = env.get_array_length(value){
+
+                let mut guard = v.write();
+
+                let mut bytes = Vec::with_capacity(len as usize);
+                bytes.resize(len as usize, 0u8);
+                env.get_byte_array_region(value, 0, std::mem::transmute(bytes.as_mut_slice()));
+                
+                let ok = guard.putBlob(row as usize, column as usize, &bytes);
+                if !ok{
+                    env.throw(("android.database.CursorWindowAllocationException", 
+                    "Failed to allocate memory."));
+                    return 0;
+                }
+                return 1;
             }
         }
         return 0;
     }
+
+    unsafe fn PutString(env:JNIEnv, obj:JObject, value:JString, row:jint, column:jint) -> jboolean{
+        if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+            if let Ok(s) = env.get_string(value){
+
+                if let Ok(s) = s.to_str(){
+                    let mut guard = v.write();
+                    
+                    let ok = guard.putString(row as usize, column as usize, s);
+                    if !ok{
+                        env.throw(("android.database.CursorWindowAllocationException", 
+                        "Failed to allocate memory."));
+
+                        return 0;
+
+                    } else{
+                        return 1;
+                    }
+                }    
+            }
+        }
+        return 0;
+    }
+
+    #[no_mangle]
+    unsafe fn PutLong(env:JNIEnv, obj:JObject, value:jlong, row:jint, column:jint) -> jboolean{
+        if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+
+            let mut guard = v.write();
+            let row = row as usize;
+            let column = column as usize;
+
+            let ok = guard.putLong(row as usize, column as usize, value);
+            return ok as jboolean;
+        }
+        return 0;
+    }
+
+    #[no_mangle]
+    unsafe fn PutDouble(env:JNIEnv, obj:JObject, value:jdouble, row:jint, column:jint) -> jboolean{
+        if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+
+            let mut guard = v.write();
+            
+            let ok = guard.putDouble(row as usize, column as usize, value);
+            return ok as jboolean;
+        }
+        return 0;
+    }
+
+    #[no_mangle]
+    unsafe fn PutNull(env:JNIEnv, obj:JObject, row:jint, column:jint) -> jboolean{
+        if let Ok(v) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(obj, "mNativePtr"){
+
+            let mut guard = v.write();
+            let ok = guard.putNull(row as usize, column as usize);
+            return ok as jboolean;
+        }
+        return 0;
+    }
+
+    pub fn register(env:JNIEnv) -> Result<(), jni::errors::Error>{
+        env.register_native_methods("android.database.CursorWindow", &[
+            todo!("register CursorWindow")
+        ])
+    }
 }
 
+
+/**
+ * SQLiteConnection
+ * Wraps a SQLite database
+ */
 #[allow(unused, non_camel_case_types, non_snake_case)]
 mod SQLiteConnection{
     use std::sync::Arc;
@@ -761,10 +1051,13 @@ mod SQLiteConnection{
     use parking_lot::Mutex;
     use lock_api::*;
 
+    use parking_lot::RwLock;
     use rusqlite::*;
     use rusqlite::types::ToSqlOutput;
 
     use crate::jni_interface::VmManager;
+
+    use super::CursorWindow::CursorWindow;
     extern crate libsqlite3_sys;
 
     struct SQLStatment<'a>{
@@ -1226,15 +1519,91 @@ mod SQLiteConnection{
     }
 
     #[no_mangle]
-    unsafe fn ExecuteForCursorWindow(env:JNIEnv, conn:JObject, stmt:jlong, window_ptr:jlong, start:jint, require:jint, countAllRows:jboolean) -> jlong{
+    unsafe fn ExecuteForCursorWindow(env:JNIEnv, conn:JObject, stmt:jlong, windowObject:JObject, mut start:jint, require:jint, countAllRows:jboolean) -> jlong{
         if let Some(stmt) = (stmt as *mut SQLStatment).as_mut(){
 
-            let re = stmt.inner.query(params_from_iter(stmt.binding.as_slice()));
-            if let Ok(v) = re{
-                return 0;
-            } else{
-                env.throw(("android/database/sqlite/SQLiteException", re.err().unwrap().to_string()));
+            if let Ok(window) = env.get_rust_field::<_,_,Arc<RwLock<CursorWindow>>>(windowObject, "mNativePtr"){
+
+                let mut window = window.write();
+
+                let re = stmt.inner.query(params_from_iter(stmt.binding.as_slice()));
+
+                if let Ok(mut rows) = re{
+                    let numColumns = rows.as_ref().unwrap().column_count();
+
+                    window.clear();
+
+                    let mut ok = window.setNumColumns(numColumns);
+                    if !ok{
+                        env.throw(("android/database/sqlite/SQLiteException", "Failed to set the cursor window column count"));
+                        return 0;
+                    }
+
+                    let mut retryCount = 0;
+                    let mut totalRows = 0;
+                    let mut addedRows = 0;
+                    let mut windowFull = false;
+                    let mut gotException = false;
+
+                    'main:while (!gotException && (!windowFull || countAllRows !=0)){
+                        let re = rows.next();
+
+                        if let Ok(row) = re{
+
+                            if row.is_none(){
+                                break;
+                            }
+                            let row = row.unwrap();
+
+                            retryCount = 0;
+                            totalRows += 1;
+
+                            if start as usize >= totalRows || windowFull{
+                                continue;
+                            }
+
+                            ok = window.allocRow();
+                            if !ok{
+                                if addedRows !=0 && start + addedRows <= require{
+                                    window.clear();
+                                    window.setNumColumns(numColumns);
+                                    start += addedRows;
+                                    addedRows = 0;
+                                    window.allocRow();
+                                } else{
+                                    env.throw(("android/database/sqlite/SQLiteException", "Failed to set the cursor window column count"));
+                                    gotException = true;
+                                }
+                            }
+
+                            for i in 0..numColumns{
+                                let ok = match row.get::<_,types::Value>(i).unwrap(){
+                                    types::Value::Null => window.putNull(addedRows as usize, i),
+                                    types::Value::Blob(b) => window.putBlob(addedRows as usize, i, &b),
+                                    types::Value::Text(s) => window.putString(addedRows as usize, i, &s),
+                                    types::Value::Integer(value) => window.putLong(addedRows as usize, i, value),
+                                    types::Value::Real(value) => window.putDouble(addedRows as usize, i, value)
+                                };
+
+                                if !ok{
+                                    windowFull = true;
+                                    continue 'main;
+                                }
+                            }
+
+                            addedRows += 1;
+                            
+                        } else{
+
+                            env.throw(("android/database/sqlite/SQLiteException", re.err().unwrap().to_string()));
+                            gotException = true;
+                        }
+                    }
+                } else{
+                    env.throw(("android/database/sqlite/SQLiteException", re.err().unwrap().to_string()));
+                }
             }
+            
         } else{
             env.throw(("android/database/sqlite/SQLiteException", "error getting Statment."));
         }
@@ -1263,7 +1632,7 @@ mod SQLiteConnection{
 
     pub fn register(env:JNIEnv) -> Result<(), jni::errors::Error>{
         env.register_native_methods("android.database.sqlite.SQLiteConnection", &[
-            
+            todo!("register SQLiteConnector")
         ])
     }
 }

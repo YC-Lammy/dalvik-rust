@@ -2056,7 +2056,6 @@ public final class R extends Object{
         public static final int unknownName = 0x0104000e;
         public static final int untitled = 0x0104000f;
         public static final int yes = 0x01040013;
-
     }
 
     public static final class style{

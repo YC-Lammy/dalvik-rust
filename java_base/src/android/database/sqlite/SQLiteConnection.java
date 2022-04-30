@@ -158,7 +158,7 @@ public final class SQLiteConnection implements CancellationSignal.OnCancelListen
     private native int nativeExecuteForChangedRowCount(long statementPtr);
     private native long nativeExecuteForLastInsertedRowId(long statementPtr);
     private native long nativeExecuteForCursorWindow(
-            long statementPtr, long windowPtr,
+            long statementPtr, CursorWindow window,
             int startPos, int requiredPos, boolean countAllRows);
     private native int nativeGetDbLookaside();
     private native void nativeCancel();
@@ -992,7 +992,7 @@ public final class SQLiteConnection implements CancellationSignal.OnCancelListen
                     attachCancellationSignal(cancellationSignal);
                     try {
                         final long result = nativeExecuteForCursorWindow(
-                                statement.mStatementPtr, window.mWindowPtr,
+                                statement.mStatementPtr, window,
                                 startPos, requiredPos, countAllRows);
                         actualPos = (int)(result >> 32);
                         countedRows = (int)result;
