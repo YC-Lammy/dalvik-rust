@@ -141,9 +141,20 @@ pub struct ClassDefinition {
 impl Display for ClassDefinition{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
-            "   type: {}\n  access_flags: {:?}\n    source_file_name: {}\n",
+            "   type: {}\n  access_flags: {:?}\n    superclass:{}\n     interfaces:{}\n     class data:{}\n    source_file_name: {}\n\n",
             self.class_type.as_str(),
             self.access_flags,
+            if let Some(v) = &self.superclass{
+                v.as_str()
+            } else{
+                "None"
+            },
+            self.interfaces.iter().map(|v|{"        ".to_string()+&v.clone()+"\n"}).collect::<String>(),
+            if let Some(d) = &self.class_data{
+                d.to_string()
+            } else{
+                "None".to_string()
+            },
             if let Some(s) = &self.source_file_name{
                 s.as_str()
             } else{
@@ -170,10 +181,25 @@ pub struct ClassData {
     pub virtual_methods: Vec<EncodedMethod>
 }
 
+impl Display for ClassData{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("      fields:\n{}\n     methods:\n{}\n        virtual methods:\n{}\n",
+        self.instance_fields.iter().map(|v|{v.to_string()+"\n"}).collect::<String>(), 
+        self.direct_methods.iter().map(|v|{v.to_string()+"\n"}).collect::<String>(), 
+        self.virtual_methods.iter().map(|v|{v.to_string()+"\n"}).collect::<String>()))
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct EncodedField {
     pub field: Rc<Field>,
     pub access_flags: Vec<AccessFlag>
+}
+
+impl Display for EncodedField{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("          name: {}\n", self.field.name))   
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -181,6 +207,12 @@ pub struct EncodedMethod {
     pub method: Rc<Method>,
     pub access_flags: Vec<AccessFlag>,
     pub code: Option<Code>
+}
+
+impl Display for EncodedMethod{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("          name: {}, definener: {}, proto: {}\n", self.method.name, self.method.definer, self.method.prototype))       
+    }
 }
 
 #[derive(Debug, PartialEq)]
